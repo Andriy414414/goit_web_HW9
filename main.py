@@ -1,47 +1,72 @@
-import re
-from datetime import datetime
+import json
+import scrapy
 
-import requests
-from bs4 import BeautifulSoup
-
-BASE_URL = 'https://index.minfin.com.ua/ua/russian-invading/casualties/'
-
-
-def get_urls():
-    urls = ["/"]
-    html_doc = requests.get(BASE_URL)
-    soup = BeautifulSoup(html_doc.text, "html.parser")
-    content = soup.select('div[class=ajaxmonth] h4[class=normal] a')
-    prefix = '/month.php?month='
-    for link in content:
-        url = prefix + re.search(r"\d{4}-\d{2}", link["id"]).group()
-        urls.append(url)
-    return urls
+from itemadapter import ItemAdapter
+from scrapy.crawler import CrawlerProcess
+from scrapy.item import Item, Field
 
 
-def spider(url):
-    result = []
-    html_doc = requests.get(BASE_URL + url)
-    soup = BeautifulSoup(html_doc.text, "html.parser")
-    content = soup.select('ul[class=see-also] li[class=gold]')
-    for li in content:
-        parse_elements = {}
-        date_key = li.find("span", attrs={"class": "black"}).text
-        try:
-            date_key = datetime.strptime(date_key, '%d-%m-%Y').isoformat()
-        except ValueError:
-            print("Invalid date")
-            continue
-        parse_elements.update({'date': date_key})
-        casualties = li.find('div').find('div').find('ul')
-        for casual in casualties:
-            name, quantity, *_ = casual.text.split('–')
-            name = name.strip()
-            quantity = re.search(r'\d+', quantity).group()
-            parse_elements.update({name: quantity})
-        result.append(parse_elements)
-    return result
+class QuoteItem(Item):
+    quote = Field()
+    author = Field()
+    tags = Field()
+
+
+class AuthorItem(Item):
+    fullname = Field()
+    born_date = Field()
+    born_location = Field()
+    description = Field()
+
+
+class DataPipline:
+    quotes = []
+    authors = []
+
+    def process_item(self, item, spider):
+        adapter = ItemAdapter(item)
+        if "fullname" in adapter.keys():
+            self.authors.append(dict(adapter))
+        if "quote" in adapter.keys():
+            self.quotes.append(dict(adapter))
+
+    def close_spider(self, spider):
+        with open("quotes.json", "w", encoding='utf-8') as fd:
+            json.dump(self.quotes, fd, ensure_ascii=False, indent=2)
+        with open("authors.json", "w", encoding='utf-8') as fd:
+            json.dump(self.authors, fd, ensure_ascii=False, indent=2)
+
+
+class QuoteSpider(scrapy.Spider):
+    name = "get_quotes"
+    allowed_domains = ['quotes.toscrape.com']
+    start_urls = ['http://quotes.toscrape.com']
+
+    custom_settings = {"ITEM_PIPELINES": {DataPipline: 300}}
+
+    def parse(self, response, **kwargs):
+        for q in response.xpath("/html//div[@class='quote']"):
+            tags = q.xpath("div[@class='tags']/a/text()").extract()
+            author = q.xpath("span/small[@class='author']/text()").get().strip()
+            quote = q.xpath("span[@class='text']/text()").get().strip()
+            yield QuoteItem(tags=tags, author=author, quote=quote)
+            yield response.follow(url=self.start_urls[0] + q.xpath("span/a/@href").get(), callback=self.parse_author)
+
+        next_link = response.xpath("/html//li[@class='next']/a/@href").get()
+        if next_link:
+            yield scrapy.Request(url=self.start_urls[0] + next_link)
+
+    @classmethod
+    def parse_author(cls, response, **kwargs):
+        content = response.xpath("/html//div[@class='author-details']")
+        fullname = content.xpath("h3[@class='author-title']/text()").get().strip()
+        born_date = content.xpath("p/span[@class='author-born-date']/text()").get().strip()
+        born_location = content.xpath("p/span[@class='author-born-location']/text()").get().strip()
+        description = content.xpath("div[@class='author-description']/text()").get().strip()
+        yield AuthorItem(fullname=fullname, born_date=born_date, born_location=born_location, description=description)
 
 
 if __name__ == '__main__':
-    pass
+    process = CrawlerProcess()
+    process.crawl(QuoteSpider)
+    process.start()
